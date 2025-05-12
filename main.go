@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,43 +27,17 @@ func randomFloatVector(dim int) []float32 {
 	return vec
 }
 
-func main() {
+func runBenchmark(concurrency int, args *Args) {
 	rand.Seed(time.Now().UnixNano())
-
-	// Command-line flags
-	addr := flag.String("addr", "localhost:19530", "Milvus server address")
-	dim := flag.Int("dim", 768, "Dimension of the float vectors")
-	batchSize := flag.Int("batch", 100, "Number of vectors per insert")
-	concurrency := flag.Int("concurrency", 10, "Number of concurrent workers")
-	interval := flag.Duration("interval", 10*time.Second, "Interval for metrics reporting")
-	duration := flag.Duration("duration", 1*time.Hour, "Benchmark duration")
-	logFile := flag.String("log", "milvus_benchmark.log", "Path to log file")
-	clean := flag.Bool("clean", false, "clean all collection")
-	flag.Parse()
-
-	logF, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		panic(fmt.Errorf("failed to open log file: %v", err))
-	}
-	defer logF.Close()
-	log := func(format string, args ...interface{}) {
-		timestamp := time.Now().UTC().Format("2006-01-02T15:04:05Z07:00")
-		line := fmt.Sprintf("[%s] %s", timestamp, fmt.Sprintf(format, args...))
-		fmt.Println(line)
-		logF.WriteString(line + "\n")
-	}
-
 	ctx := context.Background()
-	cli, err := client.New(ctx, &client.ClientConfig{Address: *addr})
+	cli, err := client.New(ctx, &client.ClientConfig{Address: args.addr})
 	if err != nil {
 		panic(fmt.Errorf("failed to connect to Milvus: %v", err))
 	}
-	log("Connect milvus %s succ", *addr)
 	defer cli.Close(ctx)
 
-	// Create random collection name
 	collectionName := "bench_" + strings.ReplaceAll(uuid.New().String(), "-", "")
-	log("Using collection: %s", collectionName)
+	args.log("Using collection: %s (concurrency: %d)", collectionName, concurrency)
 
 	has, err := cli.HasCollection(ctx, client.NewHasCollectionOption(collectionName))
 	if err != nil {
@@ -71,15 +46,14 @@ func main() {
 	if has {
 		_ = cli.DropCollection(ctx, client.NewDropCollectionOption(collectionName))
 	}
-
-	if *clean {
+	if args.clean {
 		collections, _ := cli.ListCollections(ctx, client.NewListCollectionOption())
-		log("Going to clean collections: %v", collections)
+		args.log("Going to clean collections: %v", collections)
 		for _, cname := range collections {
 			cli.DropCollection(ctx, client.NewDropCollectionOption(cname))
 		}
 		collections, _ = cli.ListCollections(ctx, client.NewListCollectionOption())
-		log("After clean: %v", collections)
+		args.log("After clean: %v", collections)
 	}
 
 	schema := &entity.Schema{
@@ -96,7 +70,7 @@ func main() {
 				Name:     "vector",
 				DataType: entity.FieldTypeFloatVector,
 				TypeParams: map[string]string{
-					"dim": fmt.Sprintf("%d", *dim),
+					"dim": fmt.Sprintf("%d", args.dim),
 				},
 			},
 		},
@@ -107,7 +81,6 @@ func main() {
 
 	const maxLatencyBucket = 1000
 	var latencyBuckets [maxLatencyBucket + 1]int64
-
 	var (
 		wg                  sync.WaitGroup
 		mu                  sync.Mutex
@@ -118,20 +91,18 @@ func main() {
 		globalIDCounter     int64 = 0
 		failedCount         int64 = 0
 	)
-	sem := make(chan struct{}, *concurrency)
+	sem := make(chan struct{}, concurrency)
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 	startAll := time.Now()
 
-	// Timer to stop sending new requests
 	go func() {
-		time.Sleep(*duration)
+		time.Sleep(args.duration)
 		runCancel()
 	}()
 
-	// Metrics goroutine
 	go func() {
-		ticker := time.NewTicker(*interval)
+		ticker := time.NewTicker(args.interval)
 		defer ticker.Stop()
 		lastTime := time.Now()
 		for {
@@ -141,7 +112,6 @@ func main() {
 			case now := <-ticker.C:
 				deltaTime := now.Sub(lastTime).Seconds()
 				lastTime = now
-
 				mu.Lock()
 				snapshot := append([]float64(nil), intervalDurations...)
 				intervalDurations = intervalDurations[:0]
@@ -149,7 +119,7 @@ func main() {
 				mu.Unlock()
 
 				if len(snapshot) == 0 {
-					log("[%.0fs] No inserts this interval", time.Since(startAll).Seconds())
+					args.log("[%.0fs] No inserts this interval", time.Since(startAll).Seconds())
 					continue
 				}
 				sort.Float64s(snapshot)
@@ -160,16 +130,12 @@ func main() {
 				avg := sum / float64(len(snapshot))
 				p99 := snapshot[int(0.99*float64(len(snapshot)))-1]
 				rps := float64(count) / deltaTime
-				log("[%.0fs] Interval Inserts: %d, RPS: %.2f, Avg: %.2fms, P99: %.2fms",
-					time.Since(startAll).Seconds(),
-					count,
-					rps,
-					avg, p99)
+				args.log("[%.0fs] Interval Inserts: %d, RPS: %.2f, Avg: %.2fms, P99: %.2fms",
+					time.Since(startAll).Seconds(), count, rps, avg, p99)
 			}
 		}
 	}()
 
-	// Insert loop
 insertLoop:
 	for {
 		select {
@@ -182,24 +148,24 @@ insertLoop:
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				ids := make([]int64, *batchSize)
-				vectors := make([][]float32, *batchSize)
-				for i := 0; i < *batchSize; i++ {
+				ids := make([]int64, args.batchSize)
+				vectors := make([][]float32, args.batchSize)
+				for i := 0; i < args.batchSize; i++ {
 					ids[i] = atomic.AddInt64(&globalIDCounter, 1)
-					vectors[i] = randomFloatVector(*dim)
+					vectors[i] = randomFloatVector(args.dim)
 				}
 
 				start := time.Now()
 				_, err := cli.Insert(ctx, client.NewColumnBasedInsertOption(
 					collectionName,
 					column.NewColumnInt64("id", ids),
-					column.NewColumnFloatVector("vector", *dim, vectors),
+					column.NewColumnFloatVector("vector", args.dim, vectors),
 				))
 				duration := time.Since(start)
 				if err == nil {
 					latency := float64(duration.Milliseconds())
-					atomic.AddInt64(&totalInserted, int64(*batchSize))
-					atomic.AddInt64(&intervalInsertCount, int64(*batchSize))
+					atomic.AddInt64(&totalInserted, int64(args.batchSize))
+					atomic.AddInt64(&intervalInsertCount, int64(args.batchSize))
 					atomic.AddInt64(&totalLatency, int64(latency))
 					mu.Lock()
 					intervalDurations = append(intervalDurations, latency)
@@ -211,7 +177,7 @@ insertLoop:
 					mu.Unlock()
 				} else {
 					atomic.AddInt64(&failedCount, 1)
-					log("Insert failed: %v", err)
+					args.log("Insert failed: %v", err)
 				}
 			}()
 		}
@@ -221,9 +187,8 @@ insertLoop:
 	total := atomic.LoadInt64(&totalInserted)
 	failures := atomic.LoadInt64(&failedCount)
 	elapsed := time.Since(startAll)
-	avgLatency := float64(totalLatency) / float64(total/int64(*batchSize))
+	avgLatency := float64(totalLatency) / float64(total/int64(args.batchSize))
 
-	// Compute approximate global P99 from histogram
 	mu.Lock()
 	totalCount := int64(0)
 	for _, c := range latencyBuckets {
@@ -241,21 +206,78 @@ insertLoop:
 	}
 	mu.Unlock()
 
-	log("\n======= Final Benchmark Result =======")
-	log("Collection: %s", collectionName)
-	log("Total inserted: %d", total)
-	log("Failed inserts: %d", failures)
-	log("Success rate: %.2f%%", 100.0*float64(total)/float64(total+failures))
-	log("Elapsed: %.2fs", elapsed.Seconds())
-	log("RPS: %.2f", float64(total)/elapsed.Seconds())
-	log("Avg latency: %.2f ms", avgLatency)
+	args.log("\n======= Final Benchmark Result for concurrency = %d =======", concurrency)
+	args.log("Collection: %s", collectionName)
+	args.log("Total inserted: %d", total)
+	args.log("Failed inserts: %d", failures)
+	args.log("Success rate: %.2f%%", 100.0*float64(total)/float64(total+failures))
+	args.log("Elapsed: %.2fs", elapsed.Seconds())
+	args.log("RPS: %.2f", float64(total)/elapsed.Seconds())
+	args.log("Avg latency: %.2f ms", avgLatency)
 	if p99 >= 0 {
-		log("Approximate global P99 latency: %d ms", p99)
+		args.log("Approximate global P99 latency: %d ms", p99)
 	} else {
-		log("Global P99 latency not available")
+		args.log("Global P99 latency not available")
 	}
-	if *clean {
-		log("clean collection: %s", collectionName)
+	if args.clean {
 		cli.DropCollection(ctx, client.NewDropCollectionOption(collectionName))
+		args.log("Drop collection %s", collectionName)
+	}
+}
+
+type Args struct {
+	addr      string
+	dim       int
+	batchSize int
+	interval  time.Duration
+	duration  time.Duration
+	logFunc   func(format string, args ...interface{})
+	logFile   *os.File
+	clean     bool
+}
+
+func (a *Args) log(format string, args ...interface{}) {
+	timestamp := time.Now().UTC().Format("2006-01-02T15:04:05Z07:00")
+	line := fmt.Sprintf("[%s] %s", timestamp, fmt.Sprintf(format, args...))
+	fmt.Println(line)
+	a.logFile.WriteString(line + "\n")
+}
+
+func main() {
+	addr := flag.String("addr", "localhost:19530", "Milvus server address")
+	dim := flag.Int("dim", 768, "Dimension of the float vectors")
+	batchSize := flag.Int("batch", 100, "Number of vectors per insert")
+	concurrencyList := flag.String("concurrency", "10,50,100", "Comma-separated list of concurrent workers")
+	interval := flag.Duration("interval", 10*time.Second, "Interval for metrics reporting")
+	duration := flag.Duration("duration", 1*time.Minute, "Benchmark duration")
+	logFile := flag.String("log", "milvus_benchmark.log", "Path to log file")
+	clean := flag.Bool("clean", false, "clean all collection")
+	flag.Parse()
+
+	logF, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		panic(fmt.Errorf("failed to open log file: %v", err))
+	}
+	defer logF.Close()
+
+	args := &Args{
+		addr:      *addr,
+		dim:       *dim,
+		batchSize: *batchSize,
+		interval:  *interval,
+		duration:  *duration,
+		logFile:   logF,
+		clean:     *clean,
+	}
+
+	args.logFunc = args.log
+
+	concurrencyValues := strings.Split(*concurrencyList, ",")
+	for _, val := range concurrencyValues {
+		c, err := strconv.Atoi(strings.TrimSpace(val))
+		if err != nil {
+			panic(fmt.Errorf("invalid concurrency value: %v", err))
+		}
+		runBenchmark(c, args)
 	}
 }
