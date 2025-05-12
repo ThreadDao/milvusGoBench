@@ -37,7 +37,7 @@ func main() {
 	interval := flag.Duration("interval", 10*time.Second, "Interval for metrics reporting")
 	duration := flag.Duration("duration", 1*time.Hour, "Benchmark duration")
 	logFile := flag.String("log", "milvus_benchmark.log", "Path to log file")
-	cleanAll := flag.Bool("clean", false, "If drop all existed collection before test")
+	clean := flag.Bool("clean", false, "clean all collection")
 	flag.Parse()
 
 	logF, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -46,14 +46,13 @@ func main() {
 	}
 	defer logF.Close()
 	log := func(format string, args ...interface{}) {
-		timestamp := time.Now().UTC().Format("2006-01-02 15:04:05.000Z")
+		timestamp := time.Now().UTC().Format("2006-01-02T15:04:05Z07:00")
 		line := fmt.Sprintf("[%s] %s", timestamp, fmt.Sprintf(format, args...))
 		fmt.Println(line)
 		logF.WriteString(line + "\n")
 	}
 
 	ctx := context.Background()
-
 	cli, err := client.New(ctx, &client.ClientConfig{Address: *addr})
 	if err != nil {
 		panic(fmt.Errorf("failed to connect to Milvus: %v", err))
@@ -64,7 +63,6 @@ func main() {
 	collectionName := "bench_" + strings.ReplaceAll(uuid.New().String(), "-", "")
 	log("Using collection: %s", collectionName)
 
-	// Drop if exists (precautionary)
 	has, err := cli.HasCollection(ctx, client.NewHasCollectionOption(collectionName))
 	if err != nil {
 		panic(err)
@@ -72,18 +70,15 @@ func main() {
 	if has {
 		_ = cli.DropCollection(ctx, client.NewDropCollectionOption(collectionName))
 	}
-	if *cleanAll {
-		collections, err := cli.ListCollections(ctx, client.NewListCollectionOption())
-		if err != nil {
-			panic(err)
+
+	if *clean {
+		collections, _ := cli.ListCollections(ctx, client.NewListCollectionOption())
+		log("Going to clean collections: %v", collections)
+		for _, cname := range collections {
+			cli.DropCollection(ctx, client.NewDropCollectionOption(cname))
 		}
-		for _, coll := range collections {
-			err = cli.DropCollection(ctx, client.NewDropCollectionOption(coll))
-			if err != nil {
-				panic(err)
-			}
-			log("Dropped collection: %s", coll)
-		}
+		collections, _ = cli.ListCollections(ctx, client.NewListCollectionOption())
+		log("After clean: %v", collections)
 	}
 
 	schema := &entity.Schema{
@@ -117,11 +112,18 @@ func main() {
 		totalInserted       int64 = 0
 		totalLatency        int64 = 0
 		globalIDCounter     int64 = 0
+		failedCount         int64 = 0
 	)
 	sem := make(chan struct{}, *concurrency)
-	ctx, cancel := context.WithTimeout(ctx, *duration)
-	defer cancel()
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
 	startAll := time.Now()
+
+	// Timer to stop sending new requests
+	go func() {
+		time.Sleep(*duration)
+		runCancel()
+	}()
 
 	// Metrics goroutine
 	go func() {
@@ -130,7 +132,7 @@ func main() {
 		lastTime := time.Now()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-runCtx.Done():
 				return
 			case now := <-ticker.C:
 				deltaTime := now.Sub(lastTime).Seconds()
@@ -164,10 +166,11 @@ func main() {
 	}()
 
 	// Insert loop
+insertLoop:
 	for {
 		select {
-		case <-ctx.Done():
-			goto finish
+		case <-runCtx.Done():
+			break insertLoop
 		default:
 			sem <- struct{}{}
 			wg.Add(1)
@@ -198,22 +201,30 @@ func main() {
 					intervalDurations = append(intervalDurations, latency)
 					mu.Unlock()
 				} else {
+					atomic.AddInt64(&failedCount, 1)
 					log("Insert failed: %v", err)
 				}
 			}()
 		}
 	}
 
-finish:
 	wg.Wait()
 	total := atomic.LoadInt64(&totalInserted)
+	failures := atomic.LoadInt64(&failedCount)
 	elapsed := time.Since(startAll)
 	avgLatency := float64(totalLatency) / float64(total/int64(*batchSize))
 	log("\n======= Final Benchmark Result =======")
 	log("Collection: %s", collectionName)
 	log("Total inserted: %d", total)
+	log("Failed inserts: %d", failures)
+	log("Success rate: %.2f%%", 100.0*float64(total)/float64(total+failures))
 	log("Elapsed: %.2fs", elapsed.Seconds())
 	log("RPS: %.2f", float64(total)/elapsed.Seconds())
 	log("Avg latency: %.2f ms", avgLatency)
 	log("Note: P99 shown only in interval logs.")
+
+	if *clean {
+		log("clean collection: %s", collectionName)
+		cli.DropCollection(ctx, client.NewDropCollectionOption(collectionName))
+	}
 }
