@@ -57,6 +57,7 @@ func main() {
 	if err != nil {
 		panic(fmt.Errorf("failed to connect to Milvus: %v", err))
 	}
+	log("Connect milvus %s succ", *addr)
 	defer cli.Close(ctx)
 
 	// Create random collection name
@@ -103,6 +104,9 @@ func main() {
 	if err := cli.CreateCollection(ctx, client.NewCreateCollectionOption(collectionName, schema).WithShardNum(1)); err != nil {
 		panic(err)
 	}
+
+	const maxLatencyBucket = 1000
+	var latencyBuckets [maxLatencyBucket + 1]int64
 
 	var (
 		wg                  sync.WaitGroup
@@ -199,6 +203,11 @@ insertLoop:
 					atomic.AddInt64(&totalLatency, int64(latency))
 					mu.Lock()
 					intervalDurations = append(intervalDurations, latency)
+					bucket := int(latency)
+					if bucket > maxLatencyBucket {
+						bucket = maxLatencyBucket
+					}
+					latencyBuckets[bucket]++
 					mu.Unlock()
 				} else {
 					atomic.AddInt64(&failedCount, 1)
@@ -213,6 +222,25 @@ insertLoop:
 	failures := atomic.LoadInt64(&failedCount)
 	elapsed := time.Since(startAll)
 	avgLatency := float64(totalLatency) / float64(total/int64(*batchSize))
+
+	// Compute approximate global P99 from histogram
+	mu.Lock()
+	totalCount := int64(0)
+	for _, c := range latencyBuckets {
+		totalCount += c
+	}
+	threshold := int64(float64(totalCount) * 0.99)
+	cumulative := int64(0)
+	p99 := -1
+	for i, c := range latencyBuckets {
+		cumulative += c
+		if cumulative >= threshold {
+			p99 = i
+			break
+		}
+	}
+	mu.Unlock()
+
 	log("\n======= Final Benchmark Result =======")
 	log("Collection: %s", collectionName)
 	log("Total inserted: %d", total)
@@ -221,8 +249,11 @@ insertLoop:
 	log("Elapsed: %.2fs", elapsed.Seconds())
 	log("RPS: %.2f", float64(total)/elapsed.Seconds())
 	log("Avg latency: %.2f ms", avgLatency)
-	log("Note: P99 shown only in interval logs.")
-
+	if p99 >= 0 {
+		log("Approximate global P99 latency: %d ms", p99)
+	} else {
+		log("Global P99 latency not available")
+	}
 	if *clean {
 		log("clean collection: %s", collectionName)
 		cli.DropCollection(ctx, client.NewDropCollectionOption(collectionName))
