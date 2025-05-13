@@ -79,7 +79,7 @@ func runBenchmark(concurrency int, args *Args) {
 		panic(err)
 	}
 
-	const maxLatencyBucket = 1000
+	const maxLatencyBucket = 5000
 	var latencyBuckets [maxLatencyBucket + 1]int64
 	var (
 		wg                  sync.WaitGroup
