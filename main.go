@@ -79,8 +79,7 @@ func runBenchmark(concurrency int, args *Args) {
 		panic(err)
 	}
 
-	var latencyBuckets []float64
-	latencyBuckets = make([]float64, args.maxLatencyBucket+1)
+	latencyBuckets := make([]int64, args.maxLatencyBucket+1)
 	var (
 		wg                  sync.WaitGroup
 		mu                  sync.Mutex
@@ -188,17 +187,17 @@ insertLoop:
 	avgLatency := float64(totalLatency) / float64(total/int64(args.batchSize))
 
 	mu.Lock()
-	totalCount := float64(0)
+	totalCount := int64(0)
 	for _, c := range latencyBuckets {
 		totalCount += c
 	}
-	threshold := totalCount * 0.99
-	cumulative := float64(0)
-	p99 := -1.0
+	threshold := int64(float64(totalCount) * 0.99)
+	cumulative := int64(0)
+	p99 := -1
 	for i, c := range latencyBuckets {
 		cumulative += c
 		if cumulative >= threshold {
-			p99 = float64(i)
+			p99 = i
 			break
 		}
 	}
@@ -214,7 +213,7 @@ insertLoop:
 	args.log("Throughput: %.2f MiB/s", float64(total)/elapsed.Seconds()*(768*4+8)/1024/1024)
 	args.log("Avg latency: %.2f ms", avgLatency)
 	if p99 >= 0 {
-		args.log("Approximate global P99 latency: %.2f ms", p99)
+		args.log("Approximate global P99 latency: %d ms", p99)
 	} else {
 		args.log("Global P99 latency not available")
 	}
