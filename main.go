@@ -213,7 +213,7 @@ insertLoop:
 	args.log("RPS: %.2f", float64(total)/elapsed.Seconds())
 	args.log("Avg latency: %.2f ms", avgLatency)
 	if p99 >= 0 {
-		args.log("Approximate global P99 latency: %d ms", p99)
+		args.log("Approximate global P99 latency: %.2f ms", p99)
 	} else {
 		args.log("Global P99 latency not available")
 	}
