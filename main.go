@@ -79,8 +79,8 @@ func runBenchmark(concurrency int, args *Args) {
 		panic(err)
 	}
 
-	const maxLatencyBucket = 5000
-	var latencyBuckets [maxLatencyBucket + 1]int64
+	var latencyBuckets []float64
+	latencyBuckets = make([]float64, args.maxLatencyBucket+1)
 	var (
 		wg                  sync.WaitGroup
 		mu                  sync.Mutex
@@ -154,26 +154,24 @@ insertLoop:
 					ids[i] = atomic.AddInt64(&globalIDCounter, 1)
 					vectors[i] = randomFloatVector(args.dim)
 				}
-
+				pkColumn := column.NewColumnInt64("id", ids)
+				vectorColumn := column.NewColumnFloatVector("vector", args.dim, vectors)
+				insertOption := client.NewColumnBasedInsertOption(collectionName, pkColumn, vectorColumn)
 				start := time.Now()
-				_, err := cli.Insert(ctx, client.NewColumnBasedInsertOption(
-					collectionName,
-					column.NewColumnInt64("id", ids),
-					column.NewColumnFloatVector("vector", args.dim, vectors),
-				))
+				_, err := cli.Insert(ctx, insertOption)
 				duration := time.Since(start)
 				if err == nil {
-					latency := float64(duration.Milliseconds())
+					latency := duration.Seconds() * 1000 // Convert to milliseconds with float64 precision
 					atomic.AddInt64(&totalInserted, int64(args.batchSize))
 					atomic.AddInt64(&intervalInsertCount, int64(args.batchSize))
 					atomic.AddInt64(&totalLatency, int64(latency))
 					mu.Lock()
 					intervalDurations = append(intervalDurations, latency)
 					bucket := int(latency)
-					if bucket > maxLatencyBucket {
-						bucket = maxLatencyBucket
+					if bucket > args.maxLatencyBucket {
+						bucket = args.maxLatencyBucket
 					}
-					latencyBuckets[bucket]++
+					latencyBuckets[bucket] += latency // Store the actual float64 latency
 					mu.Unlock()
 				} else {
 					atomic.AddInt64(&failedCount, 1)
@@ -190,17 +188,17 @@ insertLoop:
 	avgLatency := float64(totalLatency) / float64(total/int64(args.batchSize))
 
 	mu.Lock()
-	totalCount := int64(0)
+	totalCount := float64(0)
 	for _, c := range latencyBuckets {
 		totalCount += c
 	}
-	threshold := int64(float64(totalCount) * 0.99)
-	cumulative := int64(0)
-	p99 := -1
+	threshold := totalCount * 0.99
+	cumulative := float64(0)
+	p99 := -1.0
 	for i, c := range latencyBuckets {
 		cumulative += c
 		if cumulative >= threshold {
-			p99 = i
+			p99 = float64(i)
 			break
 		}
 	}
@@ -226,14 +224,15 @@ insertLoop:
 }
 
 type Args struct {
-	addr      string
-	dim       int
-	batchSize int
-	interval  time.Duration
-	duration  time.Duration
-	logFunc   func(format string, args ...interface{})
-	logFile   *os.File
-	clean     bool
+	addr             string
+	dim              int
+	batchSize        int
+	interval         time.Duration
+	duration         time.Duration
+	logFunc          func(format string, args ...interface{})
+	logFile          *os.File
+	clean            bool
+	maxLatencyBucket int
 }
 
 func (a *Args) log(format string, args ...interface{}) {
@@ -252,6 +251,7 @@ func main() {
 	duration := flag.Duration("duration", 1*time.Minute, "Benchmark duration")
 	logFile := flag.String("log", "milvus_benchmark.log", "Path to log file")
 	clean := flag.Bool("clean", false, "clean all collection")
+	maxLatencyBucket := flag.Int("max-latency", 5000, "Maximum latency bucket in milliseconds")
 	flag.Parse()
 
 	logF, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -261,13 +261,14 @@ func main() {
 	defer logF.Close()
 
 	args := &Args{
-		addr:      *addr,
-		dim:       *dim,
-		batchSize: *batchSize,
-		interval:  *interval,
-		duration:  *duration,
-		logFile:   logF,
-		clean:     *clean,
+		addr:             *addr,
+		dim:              *dim,
+		batchSize:        *batchSize,
+		interval:         *interval,
+		duration:         *duration,
+		logFile:          logF,
+		clean:            *clean,
+		maxLatencyBucket: *maxLatencyBucket,
 	}
 
 	args.logFunc = args.log
