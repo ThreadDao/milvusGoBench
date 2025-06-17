@@ -211,6 +211,7 @@ insertLoop:
 	args.log("Success rate: %.2f%%", 100.0*float64(total)/float64(total+failures))
 	args.log("Elapsed: %.2fs", elapsed.Seconds())
 	args.log("RPS: %.2f", float64(total)/elapsed.Seconds())
+	args.log("Throughput: %.2f MiB/s", float64(total)/elapsed.Seconds()*(768*4+8)/1024/1024)
 	args.log("Avg latency: %.2f ms", avgLatency)
 	if p99 >= 0 {
 		args.log("Approximate global P99 latency: %.2f ms", p99)
