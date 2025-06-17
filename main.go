@@ -171,7 +171,7 @@ insertLoop:
 					if bucket > args.maxLatencyBucket {
 						bucket = args.maxLatencyBucket
 					}
-					latencyBuckets[bucket] += latency // Store the actual float64 latency
+					latencyBuckets[bucket]++ // Store the actual float64 latency
 					mu.Unlock()
 				} else {
 					atomic.AddInt64(&failedCount, 1)
