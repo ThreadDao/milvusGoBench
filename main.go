@@ -75,7 +75,7 @@ func runBenchmark(concurrency int, args *Args) {
 			},
 		},
 	}
-	if err := cli.CreateCollection(ctx, client.NewCreateCollectionOption(collectionName, schema).WithShardNum(1)); err != nil {
+	if err := cli.CreateCollection(ctx, client.NewCreateCollectionOption(collectionName, schema).WithShardNum(int32(args.shardNum))); err != nil {
 		panic(err)
 	}
 
@@ -233,6 +233,7 @@ type Args struct {
 	logFile          *os.File
 	clean            bool
 	maxLatencyBucket int
+	shardNum         int
 }
 
 func (a *Args) log(format string, args ...interface{}) {
@@ -252,6 +253,7 @@ func main() {
 	logFile := flag.String("log", "milvus_benchmark.log", "Path to log file")
 	clean := flag.Bool("clean", false, "clean all collection")
 	maxLatencyBucket := flag.Int("max-latency", 5000, "Maximum latency bucket in milliseconds")
+	shardNum := flag.Int("shard-num", 1, "Number of shards for the collection")
 	flag.Parse()
 
 	logF, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -269,6 +271,7 @@ func main() {
 		logFile:          logF,
 		clean:            *clean,
 		maxLatencyBucket: *maxLatencyBucket,
+		shardNum:         *shardNum,
 	}
 
 	args.logFunc = args.log
